@@ -1,0 +1,19 @@
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+
+# Project data / artifacts
+JPEGImages/
+results/
+*.csv
+checkpoints/
