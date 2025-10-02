@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import torch
 import pandas as pd
 from PIL import Image
@@ -16,7 +17,6 @@ def load_labels_txt(path):
     return labels
 
 def pick_mode(auto_save_dir="../results/fine_tuned_head", requested_mode="auto"):
-    """Return 'classifier' if head exists (and not explicitly set to zero-shot), else 'zeroshot'."""
     if requested_mode.lower() == "classifier":
         return "classifier"
     if requested_mode.lower() == "zeroshot":
@@ -26,15 +26,18 @@ def pick_mode(auto_save_dir="../results/fine_tuned_head", requested_mode="auto")
     return "classifier" if head_ok else "zeroshot"
 
 def build_full_dataframe():
-    """Concatenate train/val/test into one DataFrame for inference."""
     train_df, val_df, test_df = load_dataset()
     df = pd.concat([train_df, val_df, test_df], ignore_index=True)
-    for col in ["Category"]:
-        if col in df.columns:
-            df[col] = df[col].astype(str)
+    if "Category" in df.columns:
+        df["Category"] = df["Category"].astype(str)
     return df
 
-def run_clip_inference(mode="auto"):
+def run_clip_inference(mode="auto", tta=False, save_probs=True):
+    """
+    mode: 'auto' | 'classifier' | 'zeroshot'
+    tta: if True, average prediction with a horizontally flipped version
+    save_probs: if True, include per-class probability columns in CSV
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -47,9 +50,10 @@ def run_clip_inference(mode="auto"):
 
     results_dir = "../results"
     os.makedirs(results_dir, exist_ok=True)
-    out_csv = os.path.join(results_dir,
-                           "classifier_predictions.csv" if mode == "classifier"
-                           else "clip_predictions.csv")
+    out_csv = os.path.join(
+        results_dir,
+        "classifier_predictions.csv" if mode == "classifier" else "clip_predictions.csv"
+    )
     print("Predictions will be saved to:", os.path.abspath(out_csv))
 
     if mode == "classifier" and os.path.exists(save_dir):
@@ -58,8 +62,7 @@ def run_clip_inference(mode="auto"):
         labels = load_labels_txt(os.path.join(save_dir, "labels.txt"))
         label2id = {c: i for i, c in enumerate(labels)}
         classifier = torch.nn.Linear(clip_model.config.projection_dim, len(labels)).to(device)
-        classifier.load_state_dict(torch.load(os.path.join(save_dir, "classifier.pt"),
-                                              map_location=device))
+        classifier.load_state_dict(torch.load(os.path.join(save_dir, "classifier.pt"), map_location=device))
         classifier.eval()
         print(f"Loaded classifier with {len(labels)} classes:", labels)
     else:
@@ -73,6 +76,20 @@ def run_clip_inference(mode="auto"):
     results = []
     correct = total = 0
 
+    # Simple TTA: horizontal flip
+    def _predict_probs(image: Image.Image):
+        if mode == "classifier":
+            inputs = processor(images=image, return_tensors="pt").to(device)
+            feats = clip_model.get_image_features(pixel_values=inputs["pixel_values"])
+            logits = classifier(feats)
+            probs = torch.softmax(logits, dim=1)
+            return probs.squeeze(0)
+        else:
+            inputs = processor(text=labels, images=image, return_tensors="pt", padding=True).to(device)
+            outputs = clip_model(**inputs)
+            probs = outputs.logits_per_image.softmax(dim=1)
+            return probs.squeeze(0)
+
     print("\nStarting inference...\n")
     with torch.no_grad():
         for i, row in df.iterrows():
@@ -85,33 +102,43 @@ def run_clip_inference(mode="auto"):
                 print(f"ERROR: Could not open image {image_path}. Skipping. Reason: {e}")
                 continue
 
-            if mode == "classifier":
-                inputs = processor(images=image, return_tensors="pt").to(device)
-                feats = clip_model.get_image_features(pixel_values=inputs["pixel_values"])
-                logits = classifier(feats)
-                probs = torch.softmax(logits, dim=1)
-                pred_idx = torch.argmax(probs, dim=1).item()
-                pred_label = labels[pred_idx]
-                confidence = probs[0, pred_idx].item()
-            else:
-                inputs = processor(text=labels, images=image, return_tensors="pt", padding=True).to(device)
-                outputs = clip_model(**inputs)
-                probs = outputs.logits_per_image.softmax(dim=1)
-                pred_idx = torch.argmax(probs, dim=1).item()
-                pred_label = labels[pred_idx]
-                confidence = probs[0, pred_idx].item()
+            probs = _predict_probs(image)
+
+            if tta:
+                flipped = image.transpose(Image.FLIP_LEFT_RIGHT)
+                probs_flip = _predict_probs(flipped)
+                probs = (probs + probs_flip) / 2.0
+
+            pred_idx = int(torch.argmax(probs).item())
+            pred_label = labels[pred_idx]
+            confidence = float(probs[pred_idx].item())
+
+            # Top-2 (for analysis)
+            top2_conf, top2_idx = torch.topk(probs, k=min(2, len(labels)))
+            top2_idx = top2_idx.tolist()
+            top2_conf = [float(c) for c in top2_conf.tolist()]
+            pred2_label = labels[top2_idx[1]] if len(top2_idx) > 1 else pred_label
+            pred2_conf = top2_conf[1] if len(top2_conf) > 1 else confidence
 
             is_correct = (pred_label == true_label)
             correct += int(is_correct)
             total += 1
 
-            results.append({
+            row_out = {
                 "Image": row.get("Image", i),
                 "True_Label": true_label,
                 "Predicted_Label": pred_label,
-                "Confidence": round(float(confidence), 4),
+                "Confidence": round(confidence, 4),
+                "Predicted_Label_2": pred2_label,
+                "Confidence_2": round(pred2_conf, 4),
                 "Correct": bool(is_correct)
-            })
+            }
+
+            if save_probs:
+                for j, cls in enumerate(labels):
+                    row_out[f"Prob_{cls}"] = round(float(probs[j].item()), 6)
+
+            results.append(row_out)
 
             if (i + 1) % 100 == 0:
                 print(f"Processed {i + 1}/{len(df)}")
@@ -123,6 +150,15 @@ def run_clip_inference(mode="auto"):
     print(f"Predictions saved to: {os.path.abspath(out_csv)}")
 
 if __name__ == "__main__":
-    req_mode = sys.argv[1] if len(sys.argv) > 1 else "auto"
-    run_clip_inference(mode=req_mode)
+    # usage:
+    #   python src/clip_inference.py            -> auto
+    #   python src/clip_inference.py zeroshot   -> force zero-shot
+    #   python src/clip_inference.py classifier -> force classifier
+    req_mode = "auto"
+    tta = False
+    if len(sys.argv) >= 2:
+        req_mode = sys.argv[1]
+    if len(sys.argv) >= 3:
+        tta = sys.argv[2].lower() == "tta"
+    run_clip_inference(mode=req_mode, tta=tta, save_probs=True)
 
